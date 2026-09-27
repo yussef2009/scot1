@@ -179,7 +179,7 @@ The configured API calls are located in `app.js`, including:
 - `analyzeWithGemini()`
 - `buildPrompt()`
 
-The configured model identifier is `gemini-3.8-flash`. If Google changes model availability or API requirements, update the model identifier and request format in `app.js`.
+The configured model list in `app.js` starts with `gemini-3.8-flash` and automatically falls back to other Flash models when a model is unavailable or under high demand.
 
 ## Data, privacy, and security
 

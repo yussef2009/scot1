@@ -4,7 +4,12 @@
    ═══════════════════════════════════════════════ */
 
 // ── State ──────────────────────────────────────
-const GEMINI_MODEL = 'gemini-3.8-flash';
+const GEMINI_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-3.8-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-flash-latest',
+];
 
 const state = {
   sport: 'football',
@@ -17,6 +22,7 @@ const state = {
   cachedFrames: [],             // base64 keyframes cached from scan for fast analysis
   detectedPlayers: [],          // array of player objects from scan
   selectedPlayerIds: new Set(), // which player ids are ticked
+  activeGeminiModel: GEMINI_MODELS[0],
 };
 
 // ── Sport Config ────────────────────────────────
@@ -267,7 +273,8 @@ async function startScan(force = false) {
         players = await detectPlayersWithFrames(frames);
       }
     } catch (frameErr) {
-      console.warn('Frame-based scan failed, trying full video upload:', frameErr);
+      console.warn('Frame-based scan failed:', frameErr);
+      if (state.cachedFrames.length > 0) throw frameErr;
       updateScanModalSub('Keyframe scan failed. Uploading full video...');
     }
 
@@ -428,8 +435,26 @@ function cleanAndParseJSON(text) {
   }
 }
 
-function geminiGenerateUrl() {
-  return `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${state.apiKey}`;
+function geminiGenerateUrl(model) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${state.apiKey}`;
+}
+
+function isRetryableGeminiError(status, message) {
+  const msg = (message || '').toLowerCase();
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  return /high demand|overloaded|unavailable|try again later|resource has been exhausted|temporarily/.test(msg);
+}
+
+function isUnavailableModelError(status, message) {
+  const msg = (message || '').toLowerCase();
+  return status === 404 || /not found|not supported for generatecontent/.test(msg);
+}
+
+function notifyGeminiRetry(model, waitMs, attempt) {
+  const seconds = Math.max(1, Math.round(waitMs / 1000));
+  const text = `${model} is busy (attempt ${attempt}). Retrying in ${seconds}s...`;
+  if (state.isScanning) updateScanModalSub(text);
+  else if (els.loadingLabel) els.loadingLabel.textContent = text;
 }
 
 function extractGeminiText(data) {
@@ -452,16 +477,40 @@ function extractGeminiText(data) {
 }
 
 async function geminiGenerate(body) {
-  const res = await fetch(geminiGenerateUrl(), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.error?.message || `Gemini API error (${res.status})`);
+  const models = [...new Set([state.activeGeminiModel, ...GEMINI_MODELS].filter(Boolean))];
+  let lastError = null;
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await fetch(geminiGenerateUrl(model), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        state.activeGeminiModel = model;
+        return extractGeminiText(data);
+      }
+
+      const message = data?.error?.message || `Gemini API error (${res.status})`;
+      lastError = new Error(message);
+
+      if (isUnavailableModelError(res.status, message)) break;
+
+      if (!isRetryableGeminiError(res.status, message)) throw lastError;
+
+      const retryAfter = Number(res.headers.get('Retry-After'));
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : Math.min(10000, 1500 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 500);
+
+      notifyGeminiRetry(model, waitMs, attempt);
+      await delay(waitMs);
+    }
   }
-  return extractGeminiText(data);
+
+  throw lastError || new Error('Gemini API error');
 }
 
 // ── Player detection via Frame Images ──────────
