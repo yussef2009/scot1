@@ -6,9 +6,8 @@
 // ── State ──────────────────────────────────────
 const GEMINI_MODELS = [
   'gemini-2.5-flash',
-  'gemini-3.8-flash',
   'gemini-2.5-flash-lite',
-  'gemini-flash-latest',
+  'gemini-3.8-flash',
 ];
 
 const state = {
@@ -274,8 +273,10 @@ async function startScan(force = false) {
       }
     } catch (frameErr) {
       console.warn('Frame-based scan failed:', frameErr);
-      if (state.cachedFrames.length > 0) throw frameErr;
-      updateScanModalSub('Keyframe scan failed. Uploading full video...');
+      if (/high demand|overloaded|resource has been exhausted|try again later/i.test(frameErr.message || '')) {
+        throw frameErr;
+      }
+      updateScanModalSub('Trying full video player detection...');
     }
 
     // Fallback: if frame capture returned no players or the AI call failed, use Files API
@@ -418,25 +419,176 @@ async function extractVideoFrames(videoEl, numFrames = 3) {
   });
 }
 
-// Robust JSON extraction from AI response
+const PLAYER_DETECT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    playerCount: { type: 'INTEGER' },
+    isSinglePlayer: { type: 'BOOLEAN' },
+    players: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          id: { type: 'STRING' },
+          label: { type: 'STRING' },
+          team: { type: 'STRING' },
+          teamColor: { type: 'STRING' },
+          position: { type: 'STRING' },
+          description: { type: 'STRING' },
+          standoutTrait: { type: 'STRING' },
+          emoji: { type: 'STRING' },
+        },
+        required: ['id', 'label'],
+      },
+    },
+  },
+  required: ['players'],
+};
+
+function scanGenerationConfig(withSchema = true) {
+  const config = {
+    temperature: 0.1,
+    maxOutputTokens: 8192,
+    responseMimeType: 'application/json',
+  };
+  if (withSchema) config.responseSchema = PLAYER_DETECT_SCHEMA;
+  return config;
+}
+
+function stripCodeFences(text) {
+  return String(text || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/```(?:json)?/gi, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .trim();
+}
+
+function sliceBalancedJson(text) {
+  const startObj = text.indexOf('{');
+  const startArr = text.indexOf('[');
+  let start = -1;
+  if (startObj === -1) start = startArr;
+  else if (startArr === -1) start = startObj;
+  else start = Math.min(startObj, startArr);
+  if (start === -1) return '';
+
+  let inString = false;
+  let escape = false;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+
+function closeTruncatedJson(s) {
+  let inString = false;
+  let escape = false;
+  const stack = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if (c === '}' || c === ']') stack.pop();
+  }
+  let out = s;
+  if (inString) out += '"';
+  out = out.replace(/,\s*$/, '');
+  while (stack.length) out += stack.pop();
+  return out;
+}
+
+function tryParseJson(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
 function cleanAndParseJSON(text) {
   if (!text) throw new Error('Empty response received from AI server.');
-  let cleaned = text.replace(/```json|```/g, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch (e) {
-    const jsonMatch = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-    if (jsonMatch) {
-      try {
-        return JSON.parse(jsonMatch[0]);
-      } catch (e2) { }
-    }
-    throw new Error('AI returned an invalid JSON format. Please try again.');
+  const cleaned = stripCodeFences(text);
+  const attempts = [
+    cleaned,
+    sliceBalancedJson(cleaned),
+    closeTruncatedJson(sliceBalancedJson(cleaned) || cleaned),
+    (sliceBalancedJson(cleaned) || cleaned).replace(/,\s*([}\]])/g, '$1'),
+    closeTruncatedJson((sliceBalancedJson(cleaned) || cleaned).replace(/,\s*([}\]])/g, '$1')),
+  ];
+
+  for (const candidate of attempts) {
+    const parsed = tryParseJson(candidate);
+    if (parsed) return parsed;
   }
+
+  console.warn('ScoutAI JSON parse failed. Raw preview:', cleaned.slice(0, 400));
+  throw new Error('AI returned an invalid JSON format. Please try again.');
+}
+
+function normalizeDetectedPlayers(parsed) {
+  let list = [];
+  if (Array.isArray(parsed)) list = parsed;
+  else if (Array.isArray(parsed?.players)) list = parsed.players;
+  else if (Array.isArray(parsed?.data?.players)) list = parsed.data.players;
+
+  return list
+    .filter(p => p && (p.label || p.id || p.name))
+    .map((p, i) => ({
+      id: String(p.id || `P${i + 1}`),
+      label: String(p.label || p.name || `Player ${i + 1}`),
+      team: p.team || '',
+      teamColor: p.teamColor || '#6366f1',
+      position: p.position || '',
+      description: p.description || '',
+      standoutTrait: p.standoutTrait || '',
+      emoji: p.emoji || '👤',
+    }));
+}
+
+async function requestPlayerScan(body) {
+  const configs = [scanGenerationConfig(true), scanGenerationConfig(false)];
+  let lastErr;
+  for (let i = 0; i < configs.length; i++) {
+    try {
+      const text = await geminiGenerate({ ...body, generationConfig: configs[i] });
+      return normalizeDetectedPlayers(cleanAndParseJSON(text));
+    } catch (err) {
+      lastErr = err;
+      if (state.isScanning) updateScanModalSub('Retrying player detection...');
+    }
+  }
+  throw lastErr || new Error('Player detection failed.');
+}
+
+function sanitizeGeminiModel(model) {
+  if (!model || /exp/i.test(model) || model === 'gemini-flash-latest' || model === 'gemini-2.0-flash') {
+    return GEMINI_MODELS[0];
+  }
+  return model;
 }
 
 function geminiGenerateUrl(model) {
-  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${state.apiKey}`;
+  const safeModel = sanitizeGeminiModel(model);
+  return `https://generativelanguage.googleapis.com/v1beta/models/${safeModel}:generateContent?key=${state.apiKey}`;
 }
 
 function isRetryableGeminiError(status, message) {
@@ -465,7 +617,9 @@ function extractGeminiText(data) {
   const candidate = data?.candidates?.[0];
   if (!candidate) throw new Error('Empty response from Gemini');
   const parts = candidate.content?.parts || [];
-  const text = parts.map(p => p.text).filter(Boolean).join('\n').trim();
+  const textParts = parts.map(p => p.text).filter(Boolean);
+  const jsonPart = [...textParts].reverse().find(t => /[\{\[]/.test(t));
+  const text = (jsonPart || textParts.join('\n')).trim();
   if (!text) {
     const finish = candidate.finishReason;
     if (finish === 'SAFETY') {
@@ -477,7 +631,9 @@ function extractGeminiText(data) {
 }
 
 async function geminiGenerate(body) {
-  const models = [...new Set([state.activeGeminiModel, ...GEMINI_MODELS].filter(Boolean))];
+  const models = [...new Set(
+    [sanitizeGeminiModel(state.activeGeminiModel), ...GEMINI_MODELS].filter(Boolean)
+  )];
   let lastError = null;
 
   for (const model of models) {
@@ -555,12 +711,9 @@ Return ONLY valid JSON, no extra text.`;
 
   const body = {
     contents: [{ role: 'user', parts }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' },
   };
 
-  const text = await geminiGenerate(body);
-  const parsed = cleanAndParseJSON(text);
-  return parsed.players || [];
+  return requestPlayerScan(body);
 }
 
 // ── Enable direct analysis (fallback or single-player video) ──
@@ -612,12 +765,9 @@ Return ONLY valid JSON, no extra text.`;
         { text: prompt },
       ]
     }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' },
   };
 
-  const text = await geminiGenerate(body);
-  const parsed = cleanAndParseJSON(text);
-  return parsed.players || [];
+  return requestPlayerScan(body);
 }
 
 // ── Render Player Cards ─────────────────────────
