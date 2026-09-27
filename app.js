@@ -4,6 +4,8 @@
    ═══════════════════════════════════════════════ */
 
 // ── State ──────────────────────────────────────
+const GEMINI_MODEL = 'gemini-3.8-flash';
+
 const state = {
   sport: 'football',
   videoFile: null,
@@ -196,6 +198,7 @@ els.uploadZone.addEventListener('drop', (e) => {
 function handleVideoFile(file) {
   state.videoFile = file;
   state.uploadedFileUri = null;    // reset cached URI on new file
+  state.cachedFrames = [];
   state.detectedPlayers = [];
   state.selectedPlayerIds.clear();
   const url = URL.createObjectURL(file);
@@ -214,6 +217,7 @@ function handleVideoFile(file) {
 els.clearVideoBtn.addEventListener('click', () => {
   state.videoFile = null;
   state.uploadedFileUri = null;
+  state.cachedFrames = [];
   state.detectedPlayers = [];
   state.selectedPlayerIds.clear();
   els.videoInput.value = '';
@@ -254,17 +258,20 @@ async function startScan(force = false) {
     let players = [];
 
     // Fast path: Instant frame capture from local video element
-    // Extract more frames for better analysis coverage
-    updateScanModalSub('Extracting video keyframes...');
-    const frames = await extractVideoFrames(els.videoPreview, 5);
-    if (frames && frames.length > 0) {
-      // Cache frames in state so analysis can reuse them without re-upload
-      state.cachedFrames = frames;
-      updateScanModalSub('Analyzing keyframes with AI vision...');
-      players = await detectPlayersWithFrames(frames);
+    try {
+      updateScanModalSub('Extracting video keyframes...');
+      const frames = await extractVideoFrames(els.videoPreview, 5);
+      if (frames && frames.length > 0) {
+        state.cachedFrames = frames;
+        updateScanModalSub('Analyzing keyframes with AI vision...');
+        players = await detectPlayersWithFrames(frames);
+      }
+    } catch (frameErr) {
+      console.warn('Frame-based scan failed, trying full video upload:', frameErr);
+      updateScanModalSub('Keyframe scan failed. Uploading full video...');
     }
 
-    // Fallback path: If frame capture returned no players or failed, use video upload URI
+    // Fallback: if frame capture returned no players or the AI call failed, use Files API
     if (!players || players.length === 0) {
       if (!state.uploadedFileUri || force) {
         state.uploadedFileUri = await uploadVideoToGemini(state.videoFile, (msg) => updateScanModalSub(msg));
@@ -421,6 +428,42 @@ function cleanAndParseJSON(text) {
   }
 }
 
+function geminiGenerateUrl() {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${state.apiKey}`;
+}
+
+function extractGeminiText(data) {
+  const block = data?.promptFeedback?.blockReason;
+  if (block) {
+    throw new Error(`Request blocked by the model (${block}). Try a different clip.`);
+  }
+  const candidate = data?.candidates?.[0];
+  if (!candidate) throw new Error('Empty response from Gemini');
+  const parts = candidate.content?.parts || [];
+  const text = parts.map(p => p.text).filter(Boolean).join('\n').trim();
+  if (!text) {
+    const finish = candidate.finishReason;
+    if (finish === 'SAFETY') {
+      throw new Error('The model declined this footage. Try another clip.');
+    }
+    throw new Error(finish ? `Empty Gemini response (${finish})` : 'Empty response from Gemini');
+  }
+  return text;
+}
+
+async function geminiGenerate(body) {
+  const res = await fetch(geminiGenerateUrl(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error?.message || `Gemini API error (${res.status})`);
+  }
+  return extractGeminiText(data);
+}
+
 // ── Player detection via Frame Images ──────────
 async function detectPlayersWithFrames(frames) {
   const cfg = SPORT_CONFIG[state.sport];
@@ -466,16 +509,7 @@ Return ONLY valid JSON, no extra text.`;
     generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${state.apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Scan API error (${res.status})`);
-  }
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  const text = await geminiGenerate(body);
   const parsed = cleanAndParseJSON(text);
   return parsed.players || [];
 }
@@ -532,16 +566,7 @@ Return ONLY valid JSON, no extra text.`;
     generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${state.apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Scan API error (${res.status})`);
-  }
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  const text = await geminiGenerate(body);
   const parsed = cleanAndParseJSON(text);
   return parsed.players || [];
 }
@@ -807,7 +832,8 @@ async function analyzeMultiplePlayers(players) {
   }
 
   tabs.querySelectorAll('.multi-tab').forEach((t, i) => t.addEventListener('click', () => showMultiReport(i)));
-  showMultiReport(0);
+  const firstOk = reports.findIndex(r => r.report);
+  showMultiReport(firstOk >= 0 ? firstOk : 0);
 
   state.isAnalyzing = false;
   els.analyzeBtn.disabled = false;
@@ -908,24 +934,7 @@ async function analyzeWithGeminiFrames(frames, playerContext = null) {
     },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${state.apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Gemini API error (${res.status})`);
-  }
-
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Empty response from Gemini');
-  return text;
+  return geminiGenerate(body);
 }
 
 // ── Fallback: Call Gemini Vision with uploaded file URI ────────
@@ -949,24 +958,7 @@ async function analyzeWithGemini(fileUri, playerContext = null) {
     },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${state.apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Gemini API error (${res.status})`);
-  }
-
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Empty response from Gemini');
-  return text;
+  return geminiGenerate(body);
 }
 
 // ── Build Analysis Prompt ──────────────────────
@@ -1119,7 +1111,7 @@ function fillReportDOM(d, cfg) {
   if (dlBtn) dlBtn.addEventListener('click', downloadReport);
   const naBtn = g('newAnalysisBtn');
   if (naBtn) naBtn.addEventListener('click', () => {
-    state.videoFile = null; state.uploadedFileUri = null;
+    state.videoFile = null; state.uploadedFileUri = null; state.cachedFrames = [];
     state.detectedPlayers = []; state.selectedPlayerIds.clear();
     els.videoInput.value = ''; els.videoPreview.src = '';
     els.videoPreviewWrap.classList.add('hidden');
@@ -1223,7 +1215,9 @@ function renderReport(d) {
 
 function renderMetrics(metrics) {
   if (!metrics) return;
-  els.metricsGrid.innerHTML = metrics.map(m => {
+  const grid = $('metricsGrid');
+  if (!grid) return;
+  grid.innerHTML = metrics.map(m => {
     const s = m.score;
     let tier = s >= 85 ? 's' : s >= 70 ? 'a' : s >= 55 ? 'b' : s >= 40 ? 'c' : 'd';
     return `
