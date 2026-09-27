@@ -12,6 +12,7 @@ const state = {
   isScanning: false,
   reportData: null,
   uploadedFileUri: null,        // cached after first upload
+  cachedFrames: [],             // base64 keyframes cached from scan for fast analysis
   detectedPlayers: [],          // array of player objects from scan
   selectedPlayerIds: new Set(), // which player ids are ticked
 };
@@ -253,8 +254,12 @@ async function startScan(force = false) {
     let players = [];
 
     // Fast path: Instant frame capture from local video element
-    const frames = await extractVideoFrames(els.videoPreview, 3);
+    // Extract more frames for better analysis coverage
+    updateScanModalSub('Extracting video keyframes...');
+    const frames = await extractVideoFrames(els.videoPreview, 5);
     if (frames && frames.length > 0) {
+      // Cache frames in state so analysis can reuse them without re-upload
+      state.cachedFrames = frames;
       updateScanModalSub('Analyzing keyframes with AI vision...');
       players = await detectPlayersWithFrames(frames);
     }
@@ -678,20 +683,28 @@ async function startAnalysis() {
   }
 
   try {
-    activateStep('ls1');
-    // Use cached URI if available (already uploaded during scan)
-    const fileUri = state.uploadedFileUri || await uploadVideoToGemini(state.videoFile, (msg) => {
-      els.loadingLabel.textContent = msg;
-    });
-    state.uploadedFileUri = fileUri;
+    // Fast path: use cached frames for instant analysis (no upload wait)
+    let frames = state.cachedFrames;
+    if (!frames || frames.length === 0) {
+      activateStep('ls1');
+      els.loadingLabel.textContent = 'Extracting video frames...';
+      frames = await extractVideoFrames(els.videoPreview, 5);
+      state.cachedFrames = frames;
+    } else {
+      activateStep('ls1');
+    }
 
     activateStep('ls2');
-    await delay(800);
+    els.loadingLabel.textContent = playerContext
+      ? `Analyzing ${playerContext.label} with AI...`
+      : 'Running AI performance analysis...';
+    await delay(400);
     activateStep('ls3');
-    const rawReport = await analyzeWithGemini(fileUri, playerContext);
+
+    const rawReport = await analyzeWithGeminiFrames(frames, playerContext);
 
     activateStep('ls4');
-    await delay(600);
+    await delay(400);
     const parsed = parseReport(rawReport);
     state.reportData = parsed;
     renderReport(parsed);
@@ -711,16 +724,17 @@ async function analyzeMultiplePlayers(players) {
   state.isAnalyzing = true;
   els.analyzeBtn.disabled = true;
 
-  // First ensure file is uploaded
-  if (!state.uploadedFileUri) {
+  // Ensure we have frames (fast path, no upload)
+  let frames = state.cachedFrames;
+  if (!frames || frames.length === 0) {
     showResultsSection();
     activateStep('ls1');
+    els.loadingLabel.textContent = 'Extracting video frames...';
     try {
-      state.uploadedFileUri = await uploadVideoToGemini(state.videoFile, (msg) => {
-        els.loadingLabel.textContent = msg;
-      });
+      frames = await extractVideoFrames(els.videoPreview, 5);
+      state.cachedFrames = frames;
     } catch (err) {
-      showToast(`Upload failed: ${err.message}`, 'error');
+      showToast(`Frame extraction failed: ${err.message}`, 'error');
       els.resultsSection.classList.add('hidden');
       state.isAnalyzing = false;
       els.analyzeBtn.disabled = false;
@@ -765,7 +779,7 @@ async function analyzeMultiplePlayers(players) {
     tabs.appendChild(tab);
 
     try {
-      const rawReport = await analyzeWithGemini(state.uploadedFileUri, p);
+      const rawReport = await analyzeWithGeminiFrames(frames, p);
       const parsed = parseReport(rawReport);
       reports.push({ player: p, report: parsed });
       tab.classList.remove('pending');
@@ -869,7 +883,53 @@ async function uploadVideoToGemini(file, statusCallback = null) {
   return uri;
 }
 
-// ── Call Gemini Vision ─────────────────────────
+// ── Call Gemini Vision (frame-based, fast — no upload wait) ────
+async function analyzeWithGeminiFrames(frames, playerContext = null) {
+  const cfg = SPORT_CONFIG[state.sport];
+  const prompt = buildPrompt(cfg, playerContext);
+
+  // If no frames available, throw a helpful error
+  if (!frames || frames.length === 0) {
+    throw new Error('No video frames available. Please re-scan the video first.');
+  }
+
+  // Build parts: frame images first, then the analysis prompt
+  const parts = frames.map(f => ({
+    inlineData: { mimeType: 'image/jpeg', data: f }
+  }));
+  parts.push({ text: prompt });
+
+  const body = {
+    contents: [{ role: 'user', parts }],
+    generationConfig: {
+      temperature: 0.4,
+      maxOutputTokens: 4096,
+      responseMimeType: 'application/json',
+    },
+  };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${state.apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Gemini API error (${res.status})`);
+  }
+
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Empty response from Gemini');
+  return text;
+}
+
+// ── Fallback: Call Gemini Vision with uploaded file URI ────────
+// (kept for potential future use, not called in main flow)
 async function analyzeWithGemini(fileUri, playerContext = null) {
   const cfg = SPORT_CONFIG[state.sport];
   const prompt = buildPrompt(cfg, playerContext);
@@ -890,7 +950,7 @@ async function analyzeWithGemini(fileUri, playerContext = null) {
   };
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${state.apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${state.apiKey}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
