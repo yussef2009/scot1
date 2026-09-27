@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ScoutAI — AI-Powered Sports Performance Analysis</title>
+  <meta name="description" content="Upload your sports video and get a comprehensive AI-powered scouting report with ratings, metrics, and professional analysis across football, basketball, tennis, and more." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ─── BACKGROUND ORBS ─── -->
+  <div class="bg-orb orb-1"></div>
+  <div class="bg-orb orb-2"></div>
+  <div class="bg-orb orb-3"></div>
+
+  <!-- ─── NAV ─── -->
+  <nav class="navbar" id="navbar">
+    <div class="nav-inner">
+      <div class="nav-logo">
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+          <circle cx="16" cy="16" r="14" stroke="url(#lg1)" stroke-width="2"/>
+          <path d="M10 16 L14 12 L18 16 L22 10" stroke="url(#lg2)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="22" cy="10" r="2" fill="#7c3aed"/>
+          <defs>
+            <linearGradient id="lg1" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/>
+            </linearGradient>
+            <linearGradient id="lg2" x1="10" y1="16" x2="22" y2="10" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#38bdf8"/><stop offset="1" stop-color="#818cf8"/>
+            </linearGradient>
+          </defs>
+        </svg>
+        <span>Scout<span class="logo-accent">AI</span></span>
+      </div>
+      <div class="nav-links">
+        <a href="#upload-section">Analyze</a>
+        <a href="#how-it-works">How It Works</a>
+        <a href="#sports-section">Sports</a>
+      </div>
+      <button class="btn-nav" id="openApiModal">Connect API Key</button>
+    </div>
+  </nav>
+
+  <!-- ─── HERO ─── -->
+  <header class="hero" id="home">
+    <div class="hero-badge">
+      <span class="pulse-dot"></span>
+      AI-Powered Sports Intelligence
+    </div>
+    <h1 class="hero-title">
+      Professional Scout<br/>
+      <span class="gradient-text">In Your Pocket</span>
+    </h1>
+    <p class="hero-subtitle">
+      Upload any sports video and receive a full professional scouting report — powered by advanced AI vision analysis. Ratings, strengths, weaknesses, and improvement areas across every major sport.
+    </p>
+    <div class="hero-actions">
+      <a href="#upload-section" class="btn-primary">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Upload Video
+      </a>
+      <a href="#how-it-works" class="btn-secondary">See How It Works</a>
+    </div>
+    <div class="hero-stats">
+      <div class="stat-item"><span class="stat-num">10+</span><span class="stat-label">Sports</span></div>
+      <div class="stat-divider"></div>
+      <div class="stat-item"><span class="stat-num">50+</span><span class="stat-label">Metrics</span></div>
+      <div class="stat-divider"></div>
+      <div class="stat-item"><span class="stat-num">AI</span><span class="stat-label">Powered</span></div>
+    </div>
+  </header>
+
+  <!-- ─── HOW IT WORKS ─── -->
+  <section class="how-section" id="how-it-works">
+    <div class="section-label">Process</div>
+    <h2 class="section-title">How It Works</h2>
+    <div class="steps-grid">
+      <div class="step-card">
+        <div class="step-num">01</div>
+        <div class="step-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        </div>
+        <h3>Select Your Sport</h3>
+        <p>Choose from 10+ supported sports. Each sport has tailored metrics and evaluation criteria.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">02</div>
+        <div class="step-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </div>
+        <h3>Upload Video</h3>
+        <p>Upload any video footage of the athlete in action. Supports MP4, MOV, AVI and more.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">03</div>
+        <div class="step-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M16 11c0 2.21-1.79 4-4 4s-4-1.79-4-4 1.79-4 4-4 4 1.79 4 4z"/><path d="M3 11c0-4.97 4.03-9 9-9s9 4.03 9 9"/></svg>
+        </div>
+        <h3>Select Player(s)</h3>
+        <p>If multiple players appear, AI detects them all — you pick who to scout. Analyze one or the whole team.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">04</div>
+        <div class="step-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        </div>
+        <h3>Full Scout Report</h3>
+        <p>Receive a professional-grade scouting report with scores, insights, and actionable recommendations.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── SPORTS SELECTOR ─── -->
+  <section class="sports-section" id="sports-section">
+    <div class="section-label">Supported</div>
+    <h2 class="section-title">Choose Your Sport</h2>
+    <p class="section-sub">Select the sport to tailor the AI analysis specifically for that discipline's requirements.</p>
+    <div class="sports-grid" id="sportsGrid">
+      <button class="sport-btn active" data-sport="football" id="sport-football">
+        <span class="sport-emoji">⚽</span>
+        <span class="sport-name">Football</span>
+        <span class="sport-sub">Soccer</span>
+      </button>
+      <button class="sport-btn" data-sport="basketball" id="sport-basketball">
+        <span class="sport-emoji">🏀</span>
+        <span class="sport-name">Basketball</span>
+        <span class="sport-sub">NBA style</span>
+      </button>
+      <button class="sport-btn" data-sport="tennis" id="sport-tennis">
+        <span class="sport-emoji">🎾</span>
+        <span class="sport-name">Tennis</span>
+        <span class="sport-sub">Singles/Doubles</span>
+      </button>
+      <button class="sport-btn" data-sport="swimming" id="sport-swimming">
+        <span class="sport-emoji">🏊</span>
+        <span class="sport-name">Swimming</span>
+        <span class="sport-sub">Competitive</span>
+      </button>
+      <button class="sport-btn" data-sport="athletics" id="sport-athletics">
+        <span class="sport-emoji">🏃</span>
+        <span class="sport-name">Athletics</span>
+        <span class="sport-sub">Track & Field</span>
+      </button>
+      <button class="sport-btn" data-sport="volleyball" id="sport-volleyball">
+        <span class="sport-emoji">🏐</span>
+        <span class="sport-name">Volleyball</span>
+        <span class="sport-sub">Indoor/Beach</span>
+      </button>
+      <button class="sport-btn" data-sport="boxing" id="sport-boxing">
+        <span class="sport-emoji">🥊</span>
+        <span class="sport-name">Boxing</span>
+        <span class="sport-sub">Combat Sports</span>
+      </button>
+      <button class="sport-btn" data-sport="gymnastics" id="sport-gymnastics">
+        <span class="sport-emoji">🤸</span>
+        <span class="sport-name">Gymnastics</span>
+        <span class="sport-sub">Artistic</span>
+      </button>
+      <button class="sport-btn" data-sport="cycling" id="sport-cycling">
+        <span class="sport-emoji">🚴</span>
+        <span class="sport-name">Cycling</span>
+        <span class="sport-sub">Road/Track</span>
+      </button>
+      <button class="sport-btn" data-sport="baseball" id="sport-baseball">
+        <span class="sport-emoji">⚾</span>
+        <span class="sport-name">Baseball</span>
+        <span class="sport-sub">Batting/Pitching</span>
+      </button>
+    </div>
+  </section>
+
+  <!-- ─── UPLOAD SECTION ─── -->
+  <section class="upload-section" id="upload-section">
+    <div class="section-label">Analysis</div>
+    <h2 class="section-title">Upload & Analyze</h2>
+    <p class="section-sub">Upload your video footage and let AI generate your complete scouting report.</p>
+
+    <div class="upload-container">
+      <!-- Upload Zone -->
+      <div class="upload-zone" id="uploadZone">
+        <input type="file" id="videoInput" accept="video/*" hidden />
+        <div class="upload-icon-wrap">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="url(#ugr)" stroke-width="1.5">
+            <defs>
+              <linearGradient id="ugr" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/>
+              </linearGradient>
+            </defs>
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <h3 class="upload-title">Drop Your Video Here</h3>
+        <p class="upload-hint">Supports MP4, MOV, AVI, WEBM • Max 100MB</p>
+        <button class="btn-upload" id="chooseFileBtn">Choose File</button>
+      </div>
+
+      <!-- Video Preview (hidden until file chosen) -->
+      <div class="video-preview-wrap hidden" id="videoPreviewWrap">
+        <video id="videoPreview" controls></video>
+        <div class="video-meta" id="videoMeta"></div>
+
+        <!-- ── Player Detection Banner (shown after scan) ── -->
+        <div class="player-detect-banner hidden" id="playerDetectBanner">
+          <div class="pdb-icon">👥</div>
+          <div class="pdb-text">
+            <strong id="pdbCount">Multiple players detected</strong>
+            <span id="pdbSub">Select who you want to analyze below</span>
+          </div>
+          <button class="pdb-reset" id="pdbReset" title="Re-scan">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+          </button>
+        </div>
+
+        <!-- ── Player Cards Grid ── -->
+        <div class="player-select-area hidden" id="playerSelectArea">
+          <div class="psa-header">
+            <span class="psa-title">Detected Players</span>
+            <div class="psa-actions">
+              <button class="psa-pill" id="selectAllBtn">Select All</button>
+              <button class="psa-pill" id="clearAllBtn">Clear</button>
+            </div>
+          </div>
+          <div class="player-cards-grid" id="playerCardsGrid"></div>
+          <div class="psa-note" id="psaNote">💡 You can select multiple players to get individual reports for each.</div>
+        </div>
+
+        <div class="analyze-actions">
+          <button class="btn-scan" id="scanPlayersBtn">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            Detect Players
+          </button>
+          <button class="btn-analyze hidden" id="analyzeBtn">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <span id="analyzeBtnLabel">Analyze Selected Player</span>
+          </button>
+          <button class="btn-ghost" id="clearVideoBtn">Change Video</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── RESULTS SECTION ─── -->
+  <section class="results-section hidden" id="resultsSection">
+    <div class="results-header">
+      <div class="section-label">Scouting Report</div>
+      <h2 class="section-title" id="reportTitle">Player Analysis Report</h2>
+      <div class="report-meta" id="reportMeta"></div>
+    </div>
+
+    <!-- Loading state -->
+    <div class="loading-state" id="loadingState">
+      <div class="loader-ring"></div>
+      <p class="loading-label" id="loadingLabel">Analyzing footage...</p>
+      <div class="loading-steps" id="loadingSteps">
+        <div class="load-step active" id="ls1">📡 Uploading video to AI...</div>
+        <div class="load-step" id="ls2">🎯 Focusing on selected player(s)...</div>
+        <div class="load-step" id="ls3">📊 Generating performance metrics...</div>
+        <div class="load-step" id="ls4">📝 Compiling scouting report...</div>
+      </div>
+    </div>
+
+    <!-- Report content -->
+    <div class="report-content hidden" id="reportContent">
+
+      <!-- Overall Score -->
+      <div class="overall-score-card" id="overallScoreCard">
+        <div class="score-left">
+          <div class="score-ring-wrap">
+            <canvas id="scoreRing" width="160" height="160"></canvas>
+            <div class="score-center">
+              <span class="score-num" id="overallScoreNum">--</span>
+              <span class="score-label">/ 100</span>
+            </div>
+          </div>
+          <div class="score-grade" id="scoreGrade">—</div>
+          <div class="score-grade-label">Overall Grade</div>
+        </div>
+        <div class="score-right">
+          <div class="score-sport-badge" id="scoreSportBadge"></div>
+          <h3 id="scorePlayerSummary">Analyzing...</h3>
+          <p id="scoreOneLiner"></p>
+          <div class="score-tags" id="scoreTags"></div>
+        </div>
+      </div>
+
+      <!-- Stats Grid -->
+      <div class="stats-row">
+        <!-- Radar Chart -->
+        <div class="glass-card radar-card">
+          <h3 class="card-title">Performance Radar</h3>
+          <div class="radar-wrap">
+            <canvas id="radarChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Bar Chart -->
+        <div class="glass-card bars-card">
+          <h3 class="card-title">Metric Breakdown</h3>
+          <div class="bars-wrap">
+            <canvas id="barsChart"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detailed Metrics Cards -->
+      <div class="metrics-grid" id="metricsGrid"></div>
+
+      <!-- Strengths & Weaknesses -->
+      <div class="sw-row">
+        <div class="glass-card sw-card strengths-card">
+          <h3 class="card-title">
+            <span class="card-icon green">✦</span> Strengths
+          </h3>
+          <ul class="sw-list" id="strengthsList"></ul>
+        </div>
+        <div class="glass-card sw-card weaknesses-card">
+          <h3 class="card-title">
+            <span class="card-icon red">✦</span> Areas to Improve
+          </h3>
+          <ul class="sw-list" id="weaknessesList"></ul>
+        </div>
+      </div>
+
+      <!-- Recommendations -->
+      <div class="glass-card recs-card">
+        <h3 class="card-title">
+          <span class="card-icon blue">⚡</span> AI Recommendations
+        </h3>
+        <div class="recs-list" id="recsList"></div>
+      </div>
+
+      <!-- Full Narrative -->
+      <div class="glass-card narrative-card">
+        <h3 class="card-title">
+          <span class="card-icon purple">📋</span> Full Scout's Report
+        </h3>
+        <div class="narrative-text" id="narrativeText"></div>
+      </div>
+
+      <!-- Comparison -->
+      <div class="glass-card comparison-card">
+        <h3 class="card-title">
+          <span class="card-icon gold">🏆</span> Pro Player Comparison
+        </h3>
+        <div class="comparison-content" id="comparisonContent"></div>
+      </div>
+
+      <!-- Actions -->
+      <div class="report-actions">
+        <button class="btn-primary" id="downloadReportBtn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download Report
+        </button>
+        <button class="btn-secondary" id="newAnalysisBtn">Analyze Another Video</button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ─── PLAYER SELECTION MODAL (scanning state) ─── -->
+  <div class="modal-overlay hidden" id="scanModal">
+    <div class="modal-card scan-modal-card">
+      <div class="scan-anim">
+        <div class="scan-ring"></div>
+        <div class="scan-ring scan-ring-2"></div>
+        <span class="scan-eye">👁</span>
+      </div>
+      <h3 id="scanModalTitle">Scanning Video for Players...</h3>
+      <p id="scanModalSub">AI is identifying all players in the footage. This takes a few seconds.</p>
+      <div class="scan-progress">
+        <div class="scan-progress-bar" id="scanProgressBar"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── API KEY MODAL ─── -->
+  <div class="modal-overlay hidden" id="apiModal">
+    <div class="modal-card">
+      <button class="modal-close" id="closeApiModal">✕</button>
+      <div class="modal-icon">🔑</div>
+      <h2>Connect Gemini API</h2>
+      <p>ScoutAI uses Google Gemini for video analysis. Enter your API key to get started.</p>
+      <div class="input-group">
+        <label for="apiKeyInput">Gemini API Key</label>
+        <div class="input-wrap">
+          <input type="password" id="apiKeyInput" placeholder="AIza..." autocomplete="off" />
+          <button class="toggle-vis" id="toggleApiVis">👁</button>
+        </div>
+        <small>Your key is stored locally and never sent to our servers. <a href="https://aistudio.google.com/app/apikey" target="_blank">Get a free key →</a></small>
+      </div>
+      <button class="btn-primary full-width" id="saveApiKey">Save & Connect</button>
+    </div>
+  </div>
+
+  <!-- ─── FOOTER ─── -->
+  <footer class="footer">
+    <div class="footer-inner">
+      <div class="nav-logo">
+        <svg width="24" height="24" viewBox="0 0 32 32" fill="none">
+          <circle cx="16" cy="16" r="14" stroke="url(#flg)" stroke-width="2"/>
+          <path d="M10 16 L14 12 L18 16 L22 10" stroke="#818cf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <defs><linearGradient id="flg" x1="2" y1="2" x2="30" y2="30"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs>
+        </svg>
+        <span>Scout<span class="logo-accent">AI</span></span>
+      </div>
+      <p class="footer-copy">© 2026 ScoutAI · AI-Powered Sports Intelligence</p>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
