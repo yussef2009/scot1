@@ -9,7 +9,24 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=5" />
+  <script>
+    (function () {
+      const nativeFetch = window.fetch.bind(window);
+      function rewriteGeminiUrl(url) {
+        return String(url)
+          .replaceAll('models/gemini-2.0-flash-exp', 'models/gemini-2.5-flash')
+          .replaceAll('models/gemini-flash-latest', 'models/gemini-2.5-flash');
+      }
+      window.fetch = function (input, init) {
+        if (typeof input === 'string') {
+          const next = rewriteGeminiUrl(input);
+          if (next !== input) return nativeFetch(next, init);
+        }
+        return nativeFetch(input, init);
+      };
+    })();
+  </script>
 </head>
 <body>
 
@@ -465,10 +482,10 @@
         </svg>
         <span>Scout<span class="logo-accent">AI</span></span>
       </div>
-      <p class="footer-copy">© 2026 ScoutAI · AI-Powered Sports Intelligence</p>
+      <p class="footer-copy">© 2026 ScoutAI · build 5</p>
     </div>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>
