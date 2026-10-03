@@ -1,13 +1,32 @@
 /* ═══════════════════════════════════════════════
    ScoutAI — Main Application Logic
    Uses Google Gemini API for video analysis
+   With Dynamic Model Resolution & Resilient Fallbacks
    ═══════════════════════════════════════════════ */
+
+// ── Verified Priority List of Stable Gemini Models ──
+// If the primary/requested model is unavailable (404, deprecated, unsupported),
+// rate-limited (429), or overloaded (503), the engine automatically falls
+// back through this priority chain until a working model responds.
+const STABLE_GEMINI_MODELS = [
+  'gemini-2.5-flash',       // Fast, high-intelligence multimodal Flash
+  'gemini-2.0-flash',       // Standard multimodal workhorse
+  'gemini-1.5-flash',       // Universally supported reliable fallback with wide quota
+  'gemini-3.1-pro-preview', // Latest recommended preview model
+  'gemini-2.5-flash-lite',  // Lightweight high-throughput fallback
+  'gemini-2.0-flash-lite',  // Fast fallback
+  'gemini-1.5-pro',         // High-intelligence Pro fallback
+];
+
+const DEFAULT_PRIMARY_MODEL = 'gemini-2.5-flash';
 
 // ── State ──────────────────────────────────────
 const state = {
   sport: 'football',
   videoFile: null,
   apiKey: localStorage.getItem('scoutai_gemini_key') || '',
+  primaryModel: localStorage.getItem('scoutai_primary_model') || DEFAULT_PRIMARY_MODEL,
+  activeGeminiModel: localStorage.getItem('scoutai_active_model') || DEFAULT_PRIMARY_MODEL,
   isAnalyzing: false,
   isScanning: false,
   reportData: null,
@@ -15,6 +34,7 @@ const state = {
   cachedFrames: [],             // base64 keyframes cached from scan for fast analysis
   detectedPlayers: [],          // array of player objects from scan
   selectedPlayerIds: new Set(), // which player ids are ticked
+  resolutionLog: [],            // records dynamic model switches
 };
 
 // ── Sport Config ────────────────────────────────
@@ -147,6 +167,15 @@ const els = {
   saveApiKey: $('saveApiKey'),
   downloadReportBtn: $('downloadReportBtn'),
   newAnalysisBtn: $('newAnalysisBtn'),
+  // Model resolution UI
+  navModelBadge: $('navModelBadge'),
+  navModelName: $('navModelName'),
+  primaryModelSelect: $('primaryModelSelect'),
+  customModelWrap: $('customModelWrap'),
+  customModelInput: $('customModelInput'),
+  modalActiveModelBadge: $('modalActiveModelBadge'),
+  testModelBtn: $('testModelBtn'),
+  testModelOutput: $('testModelOutput'),
 };
 
 // ── Chart instances ─────────────────────────────
@@ -196,6 +225,7 @@ els.uploadZone.addEventListener('drop', (e) => {
 function handleVideoFile(file) {
   state.videoFile = file;
   state.uploadedFileUri = null;    // reset cached URI on new file
+  state.cachedFrames = [];
   state.detectedPlayers = [];
   state.selectedPlayerIds.clear();
   const url = URL.createObjectURL(file);
@@ -214,6 +244,7 @@ function handleVideoFile(file) {
 els.clearVideoBtn.addEventListener('click', () => {
   state.videoFile = null;
   state.uploadedFileUri = null;
+  state.cachedFrames = [];
   state.detectedPlayers = [];
   state.selectedPlayerIds.clear();
   els.videoInput.value = '';
@@ -254,17 +285,23 @@ async function startScan(force = false) {
     let players = [];
 
     // Fast path: Instant frame capture from local video element
-    // Extract more frames for better analysis coverage
-    updateScanModalSub('Extracting video keyframes...');
-    const frames = await extractVideoFrames(els.videoPreview, 5);
-    if (frames && frames.length > 0) {
-      // Cache frames in state so analysis can reuse them without re-upload
-      state.cachedFrames = frames;
-      updateScanModalSub('Analyzing keyframes with AI vision...');
-      players = await detectPlayersWithFrames(frames);
+    try {
+      updateScanModalSub('Extracting video keyframes...');
+      const frames = await extractVideoFrames(els.videoPreview, 5);
+      if (frames && frames.length > 0) {
+        state.cachedFrames = frames;
+        updateScanModalSub('Analyzing keyframes with AI vision...');
+        players = await detectPlayersWithFrames(frames);
+      }
+    } catch (frameErr) {
+      console.warn('Frame-based scan failed:', frameErr);
+      if (/high demand|overloaded|resource has been exhausted|try again later/i.test(frameErr.message || '')) {
+        throw frameErr;
+      }
+      updateScanModalSub('Trying full video player detection...');
     }
 
-    // Fallback path: If frame capture returned no players or failed, use video upload URI
+    // Fallback: if frame capture returned no players or the AI call failed, use Files API
     if (!players || players.length === 0) {
       if (!state.uploadedFileUri || force) {
         state.uploadedFileUri = await uploadVideoToGemini(state.videoFile, (msg) => updateScanModalSub(msg));
@@ -404,21 +441,369 @@ async function extractVideoFrames(videoEl, numFrames = 3) {
   });
 }
 
-// Robust JSON extraction from AI response
+// ═══════════════════════════════════════════════
+// Dynamic Model Resolution Engine
+// ═══════════════════════════════════════════════
+
+/**
+ * Builds the prioritized chain of models to try.
+ * 1. User preferred/primary model (e.g. gemini-2.5-flash or test model like gemini-3.8-flash)
+ * 2. Currently active known working model
+ * 3. Stable model priority list in order of performance and availability
+ */
+function getModelPriorityList(overridePrimary = null) {
+  const preferred = overridePrimary || state.primaryModel || DEFAULT_PRIMARY_MODEL;
+  const candidates = [
+    preferred,
+    state.activeGeminiModel,
+    ...STABLE_GEMINI_MODELS,
+  ].filter(Boolean);
+
+  // Return unique candidate models preserving priority order
+  return [...new Set(candidates)];
+}
+
+function geminiGenerateUrl(model) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${state.apiKey}`;
+}
+
+/**
+ * Detects whether an error indicates the model itself is not available,
+ * not supported for generateContent, deprecated, or restricted for new users.
+ */
+function isUnavailableModelError(status, message) {
+  const msg = (message || '').toLowerCase();
+  if (status === 404 || status === 410) return true;
+  if (/no longer available|not available|not found|not supported|unknown model|invalid model|unsupported|deprecated|retired|discontinued/i.test(msg)) {
+    return true;
+  }
+  if (status === 400 || status === 403) {
+    if (/model|version|generatecontent|interactions api|please update your code/i.test(msg)) {
+      return true;
+    }
+  }
+  return /is not found for api version|not supported for generatecontent|models\/.*not found/i.test(msg);
+}
+
+/**
+ * Detects whether an error is due to temporary capacity, rate limits, or server congestion.
+ */
+function isCapacityOrQuotaError(status, message) {
+  const msg = (message || '').toLowerCase();
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  return /resource has been exhausted|quota|rate limit|high demand|overloaded|temporarily unavailable|try again later/i.test(msg);
+}
+
+function notifyModelSwitch(failedModel, nextModel, reason) {
+  const reasonText = reason === 'overloaded' ? 'is overloaded/quota limited' : 'is unavailable';
+  const text = `Model "${failedModel}" ${reasonText}. Auto-switching to "${nextModel}"...`;
+  console.warn(`[Dynamic Model Resolution] ${text}`);
+
+  if (state.isScanning) {
+    updateScanModalSub(text);
+  } else if (els.loadingLabel) {
+    els.loadingLabel.textContent = text;
+  }
+}
+
+function updateModelBadges() {
+  const name = state.activeGeminiModel || DEFAULT_PRIMARY_MODEL;
+  if (els.navModelName) els.navModelName.textContent = name;
+  if (els.modalActiveModelBadge) els.modalActiveModelBadge.textContent = name;
+}
+
+function extractGeminiText(data) {
+  const block = data?.promptFeedback?.blockReason;
+  if (block) {
+    throw new Error(`Request blocked by safety filters (${block}). Try a different video clip.`);
+  }
+  const candidate = data?.candidates?.[0];
+  if (!candidate) throw new Error('Empty response from Gemini');
+  const parts = candidate.content?.parts || [];
+  const textParts = parts.map(p => p.text).filter(Boolean);
+  const jsonPart = [...textParts].reverse().find(t => /[\{\[]/.test(t));
+  const text = (jsonPart || textParts.join('\n')).trim();
+  if (!text) {
+    const finish = candidate.finishReason;
+    if (finish === 'SAFETY') {
+      throw new Error('The model declined this footage due to safety settings. Try another clip.');
+    }
+    throw new Error(finish ? `Empty Gemini response (${finish})` : 'Empty response from Gemini');
+  }
+  return text;
+}
+
+/**
+ * Core generation function with Dynamic Model Resolution:
+ * Tries the preferred model first; if unavailable or overloaded,
+ * automatically falls back through the priority list of stable models.
+ */
+async function geminiGenerate(body, options = {}) {
+  const modelsToTry = getModelPriorityList(options.preferredModel);
+  let lastError = null;
+  const attemptedModels = [];
+
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const model = modelsToTry[mIdx];
+    attemptedModels.push(model);
+
+    // Up to 2 attempts for transient capacity errors, 1 attempt for unavailable models
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const url = geminiGenerateUrl(model);
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (res.ok) {
+          // Success! Update active working model
+          const previousActive = state.activeGeminiModel;
+          state.activeGeminiModel = model;
+          localStorage.setItem('scoutai_active_model', model);
+          updateModelBadges();
+
+          // Log dynamic fallback if we switched away from the initially attempted model
+          if (attemptedModels.length > 1) {
+            const failedModel = attemptedModels[0];
+            const msg = `Dynamic Model Resolution: Switched from "${failedModel}" to working alternative "${model}"`;
+            console.info(`[Dynamic Model Resolution] ${msg}`);
+            state.resolutionLog.push({ from: failedModel, to: model, timestamp: Date.now() });
+            showToast(`Auto-switched to working model: ${model}`, 'info');
+          }
+
+          return extractGeminiText(data);
+        }
+
+        const message = data?.error?.message || `Gemini API error (${res.status})`;
+        lastError = new Error(message);
+
+        // Case 1: Model is unavailable, deprecated, or unsupported
+        if (isUnavailableModelError(res.status, message)) {
+          // If Google suggested a replacement model in the error message, add it dynamically!
+          const suggestionMatch = message.match(/use\s+models\/([a-zA-Z0-9.\-_]+)/i);
+          if (suggestionMatch && suggestionMatch[1]) {
+            const suggestedModel = suggestionMatch[1];
+            if (!modelsToTry.includes(suggestedModel)) {
+              console.info(`[Dynamic Model Resolution] API recommended alternative: "${suggestedModel}". Enqueuing in priority list.`);
+              modelsToTry.splice(mIdx + 1, 0, suggestedModel);
+            }
+          }
+
+          const nextModel = modelsToTry[mIdx + 1];
+          if (nextModel) {
+            notifyModelSwitch(model, nextModel, 'unavailable');
+          }
+          // Break inner loop immediately to try the next model in the priority list
+          break;
+        }
+
+        // Case 2: Quota or capacity exhausted (429, 503)
+        if (isCapacityOrQuotaError(res.status, message)) {
+          const nextModel = modelsToTry[mIdx + 1];
+          if (nextModel && attempt >= 1) {
+            notifyModelSwitch(model, nextModel, 'overloaded');
+            break;
+          }
+          await delay(1200);
+          continue;
+        }
+
+        // Case 3: Bad API key (401 or 400 invalid key) -> Do not cycle models
+        if (res.status === 401 || (res.status === 400 && /api key|key not valid/i.test(message))) {
+          throw lastError;
+        }
+
+        // Other unexpected error: switch to next candidate in priority list
+        const nextCandidate = modelsToTry[mIdx + 1];
+        if (nextCandidate) {
+          console.warn(`[Dynamic Model Resolution] Model "${model}" error (${res.status}: ${message}). Switching to "${nextCandidate}"...`);
+          notifyModelSwitch(model, nextCandidate, 'unavailable');
+        }
+        break;
+
+      } catch (err) {
+        lastError = err;
+        if (err.message && /api key|key not valid/i.test(err.message)) {
+          throw err;
+        }
+        if (mIdx < modelsToTry.length - 1) {
+          console.warn(`[Dynamic Model Resolution] Request for "${model}" failed (${err.message}). Trying next candidate...`);
+          break;
+        }
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error(`Dynamic Model Resolution failed across models: ${attemptedModels.join(', ')}`);
+}
+
+// ═══════════════════════════════════════════════
+// Resilient JSON Parsing & Schemas
+// ═══════════════════════════════════════════════
+
+const PLAYER_DETECT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    playerCount: { type: 'INTEGER' },
+    isSinglePlayer: { type: 'BOOLEAN' },
+    players: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          id: { type: 'STRING' },
+          label: { type: 'STRING' },
+          team: { type: 'STRING' },
+          teamColor: { type: 'STRING' },
+          position: { type: 'STRING' },
+          description: { type: 'STRING' },
+          standoutTrait: { type: 'STRING' },
+          emoji: { type: 'STRING' },
+        },
+        required: ['id', 'label'],
+      },
+    },
+  },
+  required: ['players'],
+};
+
+function scanGenerationConfig(withSchema = true) {
+  const config = {
+    temperature: 0.1,
+    maxOutputTokens: 8192,
+    responseMimeType: 'application/json',
+  };
+  if (withSchema) config.responseSchema = PLAYER_DETECT_SCHEMA;
+  return config;
+}
+
+function stripCodeFences(text) {
+  return String(text || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/```(?:json)?/gi, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .trim();
+}
+
+function sliceBalancedJson(text) {
+  const startObj = text.indexOf('{');
+  const startArr = text.indexOf('[');
+  let start = -1;
+  if (startObj === -1) start = startArr;
+  else if (startArr === -1) start = startObj;
+  else start = Math.min(startObj, startArr);
+  if (start === -1) return '';
+
+  let inString = false;
+  let escape = false;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+
+function closeTruncatedJson(s) {
+  let inString = false;
+  let escape = false;
+  const stack = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (c === '\\') { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if (c === '}' || c === ']') stack.pop();
+  }
+  let out = s;
+  if (inString) out += '"';
+  out = out.replace(/,\s*$/, '');
+  while (stack.length) out += stack.pop();
+  return out;
+}
+
+function tryParseJson(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
 function cleanAndParseJSON(text) {
   if (!text) throw new Error('Empty response received from AI server.');
-  let cleaned = text.replace(/```json|```/g, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch (e) {
-    const jsonMatch = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-    if (jsonMatch) {
-      try {
-        return JSON.parse(jsonMatch[0]);
-      } catch (e2) { }
-    }
-    throw new Error('AI returned an invalid JSON format. Please try again.');
+  const cleaned = stripCodeFences(text);
+  const attempts = [
+    cleaned,
+    sliceBalancedJson(cleaned),
+    closeTruncatedJson(sliceBalancedJson(cleaned) || cleaned),
+    (sliceBalancedJson(cleaned) || cleaned).replace(/,\s*([}\]])/g, '$1'),
+    closeTruncatedJson((sliceBalancedJson(cleaned) || cleaned).replace(/,\s*([}\]])/g, '$1')),
+  ];
+
+  for (const candidate of attempts) {
+    const parsed = tryParseJson(candidate);
+    if (parsed) return parsed;
   }
+
+  console.warn('[ScoutAI] JSON parse failed. Preview:', cleaned.slice(0, 300));
+  throw new Error('AI returned an invalid JSON format. Please try again.');
+}
+
+function normalizeDetectedPlayers(parsed) {
+  let list = [];
+  if (Array.isArray(parsed)) list = parsed;
+  else if (Array.isArray(parsed?.players)) list = parsed.players;
+  else if (Array.isArray(parsed?.data?.players)) list = parsed.data.players;
+
+  return list
+    .filter(p => p && (p.label || p.id || p.name))
+    .map((p, i) => ({
+      id: String(p.id || `P${i + 1}`),
+      label: String(p.label || p.name || `Player ${i + 1}`),
+      team: p.team || '',
+      teamColor: p.teamColor || '#6366f1',
+      position: p.position || '',
+      description: p.description || '',
+      standoutTrait: p.standoutTrait || '',
+      emoji: p.emoji || '👤',
+    }));
+}
+
+async function requestPlayerScan(body) {
+  const configs = [scanGenerationConfig(true), scanGenerationConfig(false)];
+  let lastErr;
+  for (let i = 0; i < configs.length; i++) {
+    try {
+      const text = await geminiGenerate({ ...body, generationConfig: configs[i] });
+      return normalizeDetectedPlayers(cleanAndParseJSON(text));
+    } catch (err) {
+      lastErr = err;
+      if (state.isScanning) updateScanModalSub('Retrying player detection...');
+    }
+  }
+  throw lastErr || new Error('Player detection failed.');
 }
 
 // ── Player detection via Frame Images ──────────
@@ -463,21 +848,9 @@ Return ONLY valid JSON, no extra text.`;
 
   const body = {
     contents: [{ role: 'user', parts }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${state.apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Scan API error (${res.status})`);
-  }
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  const parsed = cleanAndParseJSON(text);
-  return parsed.players || [];
+  return requestPlayerScan(body);
 }
 
 // ── Enable direct analysis (fallback or single-player video) ──
@@ -507,7 +880,7 @@ Return ONLY valid JSON in this exact format:
   "isSinglePlayer": <true if only 1 person in video, false otherwise>,
   "players": [
     {
-      "id": "<unique short id like P1, P2, etc.>",
+      "id": "P1",
       "label": "<jersey number or descriptive name>",
       "team": "<team name or color>",
       "teamColor": "<hex color code representing team color, e.g. #e53e3e>",
@@ -529,21 +902,9 @@ Return ONLY valid JSON, no extra text.`;
         { text: prompt },
       ]
     }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${state.apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Scan API error (${res.status})`);
-  }
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  const parsed = cleanAndParseJSON(text);
-  return parsed.players || [];
+  return requestPlayerScan(body);
 }
 
 // ── Render Player Cards ─────────────────────────
@@ -642,7 +1003,6 @@ els.clearAllBtn.addEventListener('click', () => {
 function showScanModal(title, sub) {
   els.scanModalTitle.textContent = title;
   els.scanModalSub.textContent = sub;
-  // Reset progress bar animation
   els.scanProgressBar.style.animation = 'none';
   void els.scanProgressBar.offsetWidth;
   els.scanProgressBar.style.animation = '';
@@ -683,7 +1043,7 @@ async function startAnalysis() {
   }
 
   try {
-    // Fast path: use cached frames for instant analysis (no upload wait)
+    // Fast path: use cached frames for instant analysis
     let frames = state.cachedFrames;
     if (!frames || frames.length === 0) {
       activateStep('ls1');
@@ -724,90 +1084,71 @@ async function analyzeMultiplePlayers(players) {
   state.isAnalyzing = true;
   els.analyzeBtn.disabled = true;
 
-  // Ensure we have frames (fast path, no upload)
-  let frames = state.cachedFrames;
-  if (!frames || frames.length === 0) {
-    showResultsSection();
-    activateStep('ls1');
-    els.loadingLabel.textContent = 'Extracting video frames...';
-    try {
-      frames = await extractVideoFrames(els.videoPreview, 5);
-      state.cachedFrames = frames;
-    } catch (err) {
-      showToast(`Frame extraction failed: ${err.message}`, 'error');
-      els.resultsSection.classList.add('hidden');
-      state.isAnalyzing = false;
-      els.analyzeBtn.disabled = false;
-      return;
-    }
-  }
-
-  // For multi-player mode, show a combined results heading
-  els.resultsSection.classList.remove('hidden');
-  els.loadingState.classList.add('hidden');
-  els.reportContent.classList.add('hidden');
-  els.reportTitle.textContent = `Multi-Player Scout Report (${players.length} players)`;
-  els.reportMeta.innerHTML = `<span class="meta-chip">${SPORT_CONFIG[state.sport].emoji} ${SPORT_CONFIG[state.sport].name}</span><span class="meta-chip">${players.length} players analyzed</span>`;
-  els.resultsSection.scrollIntoView({ behavior: 'smooth' });
-
-  // Render a tab strip for players
-  const container = els.reportContent;
-  container.classList.remove('hidden');
-  container.innerHTML = `
-    <div class="multi-player-tabs" id="multiTabs"></div>
-    <div id="multiReportSlot"></div>
-  `;
-
-  const tabs = $('multiTabs');
-  const slot = $('multiReportSlot');
+  showResultsSection();
   const reports = [];
+
+  // Create a tab bar at top of results
+  let tabs = document.getElementById('multiPlayerTabs');
+  if (!tabs) {
+    tabs = document.createElement('div');
+    tabs.id = 'multiPlayerTabs';
+    tabs.className = 'multi-player-tabs';
+    els.resultsSection.insertBefore(tabs, els.loadingState);
+  }
+  tabs.classList.remove('hidden');
+  tabs.innerHTML = players.map((p, i) => `
+    <button class="multi-tab ${i === 0 ? 'active' : ''} pending" data-idx="${i}" id="mtab-${i}">
+      ${p.emoji || '👤'} ${p.label}
+    </button>
+  `).join('');
 
   for (let i = 0; i < players.length; i++) {
     const p = players[i];
-    // Show loading in slot
-    slot.innerHTML = `
-      <div class="loading-state" style="padding:60px 0">
-        <div class="loader-ring"></div>
-        <p class="loading-label">Analyzing ${p.label} (${i + 1}/${players.length})...</p>
-      </div>
-    `;
-    // Add tab
-    const tab = document.createElement('button');
-    tab.className = 'multi-tab' + (i === 0 ? ' active' : ' pending');
-    tab.textContent = `${p.emoji || '👤'} ${p.label}`;
-    tab.dataset.idx = i;
-    tabs.appendChild(tab);
+    const tab = document.getElementById(`mtab-${i}`);
+    els.loadingLabel.textContent = `Analyzing player ${i + 1} of ${players.length}: ${p.label}...`;
+    activateStep('ls2');
 
     try {
-      const rawReport = await analyzeWithGeminiFrames(frames, p);
-      const parsed = parseReport(rawReport);
+      let frames = state.cachedFrames;
+      if (!frames || frames.length === 0) {
+        frames = await extractVideoFrames(els.videoPreview, 5);
+        state.cachedFrames = frames;
+      }
+      activateStep('ls3');
+      const raw = await analyzeWithGeminiFrames(frames, p);
+      activateStep('ls4');
+      const parsed = parseReport(raw);
       reports.push({ player: p, report: parsed });
-      tab.classList.remove('pending');
-      tab.classList.add('done');
-    } catch (err) {
-      reports.push({ player: p, report: null, error: err.message });
-      tab.classList.remove('pending');
-      tab.classList.add('error');
+      if (tab) {
+        tab.classList.remove('pending');
+        tab.classList.add('done');
+      }
+    } catch (e) {
+      console.warn(`Analysis failed for ${p.label}:`, e);
+      reports.push({ player: p, report: null, error: e.message });
+      if (tab) {
+        tab.classList.remove('pending');
+        tab.classList.add('error');
+      }
     }
   }
 
-  // Attach tab click to show that player's report
+  // Helper to switch tab
   function showMultiReport(idx) {
-    const cfg = SPORT_CONFIG[state.sport];
-    tabs.querySelectorAll('.multi-tab').forEach((t, ti) => t.classList.toggle('active', ti === idx));
-    const { player, report, error } = reports[idx];
-    if (error || !report) {
-      slot.innerHTML = `<div class="glass-card" style="padding:40px;text-align:center;color:var(--rose)">⚠️ Analysis failed for ${player.label}: ${error}</div>`;
-      return;
+    tabs.querySelectorAll('.multi-tab').forEach((t, i) => {
+      t.classList.toggle('active', i === idx);
+    });
+    const entry = reports[idx];
+    if (entry && entry.report) {
+      renderReport(entry.report);
+    } else if (entry && entry.error) {
+      showToast(`Analysis failed for ${entry.player.label}: ${entry.error}`, 'error');
     }
-    state.reportData = report;
-    // Rebuild inner report HTML
-    slot.innerHTML = getReportHTML();
-    fillReportDOM(report, cfg);
   }
 
   tabs.querySelectorAll('.multi-tab').forEach((t, i) => t.addEventListener('click', () => showMultiReport(i)));
-  showMultiReport(0);
+  const firstOk = reports.findIndex(r => r.report);
+  showMultiReport(firstOk >= 0 ? firstOk : 0);
 
   state.isAnalyzing = false;
   els.analyzeBtn.disabled = false;
@@ -888,12 +1229,10 @@ async function analyzeWithGeminiFrames(frames, playerContext = null) {
   const cfg = SPORT_CONFIG[state.sport];
   const prompt = buildPrompt(cfg, playerContext);
 
-  // If no frames available, throw a helpful error
   if (!frames || frames.length === 0) {
     throw new Error('No video frames available. Please re-scan the video first.');
   }
 
-  // Build parts: frame images first, then the analysis prompt
   const parts = frames.map(f => ({
     inlineData: { mimeType: 'image/jpeg', data: f }
   }));
@@ -908,28 +1247,10 @@ async function analyzeWithGeminiFrames(frames, playerContext = null) {
     },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${state.apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Gemini API error (${res.status})`);
-  }
-
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Empty response from Gemini');
-  return text;
+  return geminiGenerate(body);
 }
 
 // ── Fallback: Call Gemini Vision with uploaded file URI ────────
-// (kept for potential future use, not called in main flow)
 async function analyzeWithGemini(fileUri, playerContext = null) {
   const cfg = SPORT_CONFIG[state.sport];
   const prompt = buildPrompt(cfg, playerContext);
@@ -949,24 +1270,7 @@ async function analyzeWithGemini(fileUri, playerContext = null) {
     },
   };
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${state.apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Gemini API error (${res.status})`);
-  }
-
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('Empty response from Gemini');
-  return text;
+  return geminiGenerate(body);
 }
 
 // ── Build Analysis Prompt ──────────────────────
@@ -988,29 +1292,37 @@ Analyze the video carefully and produce a comprehensive scouting report in the f
   "metrics": [
     ${cfg.metrics.map(m => `{"name": "${m}", "score": <0-100>, "note": "<brief observation>"}`).join(',\n    ')}
   ],
-  "strengths": [<5-7 specific strength statements>],
-  "weaknesses": [<4-6 specific improvement areas>],
-  "recommendations": [<5 concrete, actionable training/improvement recommendations>],
-  "narrative": "<detailed 3-4 paragraph scouting narrative as a professional scout would write it, covering technical ability, physical attributes, tactical understanding, and potential>",
-  "proComparisons": [
-    {"name": "<Pro player name>", "emoji": "<sport emoji>", "similarity": "<XX%>", "reason": "<why similar>"},
-    {"name": "<Pro player name>", "emoji": "<sport emoji>", "similarity": "<XX%>", "reason": "<why similar>"},
-    {"name": "<Pro player name>", "emoji": "<sport emoji>", "similarity": "<XX%>", "reason": "<why similar>"}
+  "strengths": [
+    <3-4 specific observable strengths from this footage>
   ],
-  "potentialRating": <integer 0-100>,
-  "position": "<recommended position or role>",
-  "ageCategory": "<Youth|Junior|Senior|Veteran>"
+  "weaknesses": [
+    <2-3 specific observable areas to improve from this footage>
+  ],
+  "recommendations": [
+    <3 concrete training drills or tactical adjustments for this player>
+  ],
+  "narrative": <a detailed 3-paragraph professional scouting report: Paragraph 1 on physical/technical profile, Paragraph 2 on tactical execution and gameplay, Paragraph 3 on developmental ceiling and pathway>,
+  "proComparisons": [
+    {
+      "name": "<well-known pro player in this sport>",
+      "similarity": "<percentage string like 85%>",
+      "reason": "<why this player's style or technique resembles them>",
+      "emoji": "<player emoji or country flag>"
+    }
+  ]
 }
 
-IMPORTANT:
-- Be honest and specific — base ALL observations on what you actually see in the video
-- If the video quality is poor or certain aspects are hard to judge, note this in the relevant metric note
-- Scores should be realistic and calibrated (50 = average amateur, 70 = good club player, 85+ = elite)
+Calibrate scores realistically:
+- 50 = average amateur
+- 70 = good club player
+- 85+ = elite / academy talent
+- Grade S = 85+, A = 70-84, B = 55-69, C = 40-54, D = <40
+- Be specific about what you see in the video, not generic praise
 - The narrative should feel like it was written by an experienced human scout
 - Return ONLY valid JSON, no extra text`;
 }
 
-// ─── Parse & Validate Report ───────────────────
+// ── Parse & Validate Report ───────────────────
 function parseReport(raw) {
   try {
     return cleanAndParseJSON(raw);
@@ -1023,7 +1335,6 @@ function parseReport(raw) {
 // Render Report
 // ═══════════════════════════════════════════════
 
-// Returns the inner HTML skeleton for a single report (used in multi-player tab mode)
 function getReportHTML() {
   return `
     <div class="overall-score-card" id="overallScoreCard">
@@ -1088,7 +1399,6 @@ function getReportHTML() {
   `;
 }
 
-// Fills the report DOM nodes (works both in main slot and multi-player slot)
 function fillReportDOM(d, cfg) {
   const g = id => document.getElementById(id);
 
@@ -1114,14 +1424,18 @@ function fillReportDOM(d, cfg) {
   g('comparisonContent').innerHTML = (d.proComparisons || [])
     .map(c => `<div class="comp-player"><div class="comp-avatar">${c.emoji || '🏅'}</div><div class="comp-info"><h4>${c.name}</h4><p>${c.reason}</p><div class="comp-pct">${c.similarity} match</div></div></div>`).join('');
 
-  // Wire download/new analysis in multi-player slot
+  // Wire download / new analysis buttons
   const dlBtn = g('downloadReportBtn');
   if (dlBtn) dlBtn.addEventListener('click', downloadReport);
   const naBtn = g('newAnalysisBtn');
   if (naBtn) naBtn.addEventListener('click', () => {
-    state.videoFile = null; state.uploadedFileUri = null;
-    state.detectedPlayers = []; state.selectedPlayerIds.clear();
-    els.videoInput.value = ''; els.videoPreview.src = '';
+    state.videoFile = null;
+    state.uploadedFileUri = null;
+    state.cachedFrames = [];
+    state.detectedPlayers = [];
+    state.selectedPlayerIds.clear();
+    els.videoInput.value = '';
+    els.videoPreview.src = '';
     els.videoPreviewWrap.classList.add('hidden');
     els.uploadZone.classList.remove('hidden');
     els.resultsSection.classList.add('hidden');
@@ -1150,8 +1464,6 @@ function renderReport(d) {
     <span class="meta-chip">Grade: ${d.overallGrade}</span>
     ${d.position ? `<span class="meta-chip">${d.position}</span>` : ''}
   `;
-
-
 
   // Overall Score
   els.overallScoreNum.textContent = d.overallScore;
@@ -1223,7 +1535,9 @@ function renderReport(d) {
 
 function renderMetrics(metrics) {
   if (!metrics) return;
-  els.metricsGrid.innerHTML = metrics.map(m => {
+  const grid = $('metricsGrid');
+  if (!grid) return;
+  grid.innerHTML = metrics.map(m => {
     const s = m.score;
     let tier = s >= 85 ? 's' : s >= 70 ? 'a' : s >= 55 ? 'b' : s >= 40 ? 'c' : 'd';
     return `
@@ -1241,6 +1555,7 @@ function renderMetrics(metrics) {
 
 function renderScoreRing(score) {
   const canvas = $('scoreRing');
+  if (!canvas) return;
   const ctx = canvas.getContext('2d');
   if (scoreRing) { scoreRing.destroy(); scoreRing = null; }
 
@@ -1266,11 +1581,11 @@ function renderScoreRing(score) {
 }
 
 function renderRadar(d, cfg) {
-  const ctx = $('radarChart').getContext('2d');
+  const canvas = $('radarChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
   if (radarChart) { radarChart.destroy(); radarChart = null; }
 
-  const allScores = (d.metrics || []).map(m => m.score);
-  // Pick first 6 metrics for radar
   const sliced = (d.metrics || []).slice(0, 6);
   const labels = sliced.map(m => m.name);
   const scores = sliced.map(m => m.score);
@@ -1310,7 +1625,9 @@ function renderRadar(d, cfg) {
 }
 
 function renderBars(d) {
-  const ctx = $('barsChart').getContext('2d');
+  const canvas = $('barsChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
   if (barsChart) { barsChart.destroy(); barsChart = null; }
 
   const metrics = (d.metrics || []);
@@ -1336,7 +1653,8 @@ function renderBars(d) {
       responsive: true,
       indexAxis: 'y',
       plugins: {
-        legend: { display: false }, tooltip: {
+        legend: { display: false },
+        tooltip: {
           callbacks: {
             label: ctx => ` ${ctx.raw}/100`,
           },
@@ -1365,10 +1683,9 @@ function showResultsSection() {
   els.resultsSection.classList.remove('hidden');
   els.loadingState.classList.remove('hidden');
   els.reportContent.classList.add('hidden');
-  // Reset steps
   ['ls1', 'ls2', 'ls3', 'ls4'].forEach(id => {
     const el = $(id);
-    el.classList.remove('active', 'done');
+    if (el) el.classList.remove('active', 'done');
   });
   els.resultsSection.scrollIntoView({ behavior: 'smooth' });
 }
@@ -1376,9 +1693,10 @@ function showResultsSection() {
 function activateStep(id) {
   ['ls1', 'ls2', 'ls3', 'ls4'].forEach(sid => {
     const el = $(sid);
-    if (el.classList.contains('active')) el.classList.replace('active', 'done');
+    if (el && el.classList.contains('active')) el.classList.replace('active', 'done');
   });
-  $(id).classList.add('active');
+  const current = $(id);
+  if (current) current.classList.add('active');
 }
 
 function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
@@ -1405,15 +1723,42 @@ function showToast(msg, type = 'info', duration = null) {
 }
 
 // ═══════════════════════════════════════════════
-// API Key Modal
+// API Key & Model Settings Modal
 // ═══════════════════════════════════════════════
 function showApiModal() {
   els.apiKeyInput.value = state.apiKey;
+  updateModelBadges();
+
+  // Set selected value in primaryModelSelect
+  const currentPrimary = state.primaryModel || DEFAULT_PRIMARY_MODEL;
+  let optionFound = false;
+  if (els.primaryModelSelect) {
+    for (let opt of els.primaryModelSelect.options) {
+      if (opt.value === currentPrimary) {
+        els.primaryModelSelect.value = currentPrimary;
+        optionFound = true;
+        break;
+      }
+    }
+    if (!optionFound) {
+      els.primaryModelSelect.value = 'custom';
+      if (els.customModelWrap) els.customModelWrap.classList.remove('hidden');
+      if (els.customModelInput) els.customModelInput.value = currentPrimary;
+    } else {
+      if (els.customModelWrap) els.customModelWrap.classList.add('hidden');
+    }
+  }
+
   els.apiModal.classList.remove('hidden');
 }
-function hideApiModal() { els.apiModal.classList.add('hidden'); }
+
+function hideApiModal() {
+  els.apiModal.classList.add('hidden');
+  if (els.testModelOutput) els.testModelOutput.classList.add('hidden');
+}
 
 els.openApiModal.addEventListener('click', showApiModal);
+if (els.navModelBadge) els.navModelBadge.addEventListener('click', showApiModal);
 els.closeApiModal.addEventListener('click', hideApiModal);
 els.apiModal.addEventListener('click', (e) => { if (e.target === els.apiModal) hideApiModal(); });
 
@@ -1423,14 +1768,115 @@ els.toggleApiVis.addEventListener('click', () => {
   els.toggleApiVis.textContent = input.type === 'password' ? '👁' : '🙈';
 });
 
+if (els.primaryModelSelect) {
+  els.primaryModelSelect.addEventListener('change', () => {
+    if (els.primaryModelSelect.value === 'custom') {
+      if (els.customModelWrap) els.customModelWrap.classList.remove('hidden');
+      if (els.customModelInput) els.customModelInput.focus();
+    } else {
+      if (els.customModelWrap) els.customModelWrap.classList.add('hidden');
+    }
+  });
+}
+
 els.saveApiKey.addEventListener('click', () => {
   const key = els.apiKeyInput.value.trim();
   if (!key) { showToast('Please enter a valid API key.', 'error'); return; }
   state.apiKey = key;
   localStorage.setItem('scoutai_gemini_key', key);
+
+  let selectedModel = els.primaryModelSelect?.value || DEFAULT_PRIMARY_MODEL;
+  if (selectedModel === 'custom') {
+    selectedModel = els.customModelInput?.value.trim() || DEFAULT_PRIMARY_MODEL;
+  }
+  state.primaryModel = selectedModel;
+  localStorage.setItem('scoutai_primary_model', selectedModel);
+
+  // Set active model to selected primary initially
+  state.activeGeminiModel = selectedModel;
+  localStorage.setItem('scoutai_active_model', selectedModel);
+
+  updateModelBadges();
   hideApiModal();
-  showToast('API key saved successfully!', 'success');
+  showToast('Settings saved! Dynamic Model Resolution is active.', 'success');
 });
+
+// ── Interactive Dynamic Model Resolution Test ──
+if (els.testModelBtn) {
+  els.testModelBtn.addEventListener('click', testModelResolution);
+}
+
+async function testModelResolution() {
+  const key = (els.apiKeyInput?.value || state.apiKey || '').trim();
+  if (!key) {
+    showToast('Please enter your Gemini API key first.', 'error');
+    els.apiKeyInput.focus();
+    return;
+  }
+  state.apiKey = key;
+
+  let modelToTest = els.primaryModelSelect?.value || state.primaryModel || DEFAULT_PRIMARY_MODEL;
+  if (modelToTest === 'custom') {
+    modelToTest = els.customModelInput?.value.trim() || DEFAULT_PRIMARY_MODEL;
+  }
+
+  els.testModelBtn.disabled = true;
+  els.testModelOutput.classList.remove('hidden');
+  els.testModelOutput.innerHTML = `
+    <div style="display:flex; align-items:center; gap:8px; color: var(--indigo);">
+      <span class="pulse-dot"></span>
+      <span>Attempting connection with preferred model: <code>${modelToTest}</code>...</span>
+    </div>
+  `;
+
+  const testBody = {
+    contents: [{
+      role: 'user',
+      parts: [{ text: 'Respond with valid JSON only: {"status":"active","resolutionTest":true}' }]
+    }],
+    generationConfig: { temperature: 0.1, maxOutputTokens: 64, responseMimeType: 'application/json' },
+  };
+
+  try {
+    const raw = await geminiGenerate(testBody, { preferredModel: modelToTest });
+    const parsed = cleanAndParseJSON(raw);
+    const resolvedModel = state.activeGeminiModel;
+    const didSwitch = (resolvedModel !== modelToTest);
+
+    if (didSwitch) {
+      els.testModelOutput.innerHTML = `
+        <div style="color: var(--gold); font-weight: 700; margin-bottom: 6px;">
+          ⚡ Dynamic Fallback Triggered & Successful!
+        </div>
+        <div style="font-size: 13px; color: var(--text-2); line-height: 1.5;">
+          Preferred model <code style="color: var(--rose);">${modelToTest}</code> was unavailable or unsupported.<br/>
+          <strong>Dynamic Model Resolution</strong> automatically switched to working alternative:
+          <strong style="color: var(--emerald); font-family: var(--mono);">${resolvedModel}</strong>.
+        </div>
+      `;
+    } else {
+      els.testModelOutput.innerHTML = `
+        <div style="color: var(--emerald); font-weight: 700; margin-bottom: 6px;">
+          ✓ Primary Model Online & Responsive!
+        </div>
+        <div style="font-size: 13px; color: var(--text-2);">
+          Connected directly to <strong style="color: var(--cyan); font-family: var(--mono);">${resolvedModel}</strong>.
+          Priority fallback chain is on standby.
+        </div>
+      `;
+    }
+    updateModelBadges();
+    showToast(`Model verified: ${resolvedModel}`, 'success');
+  } catch (err) {
+    els.testModelOutput.innerHTML = `
+      <div style="color: var(--rose); font-weight: 700; margin-bottom: 6px;">✕ Resolution Test Failed</div>
+      <div style="font-size: 13px; color: var(--text-2);">${err.message}</div>
+    `;
+    showToast('Resolution test failed. Check API key.', 'error');
+  } finally {
+    els.testModelBtn.disabled = false;
+  }
+}
 
 // ═══════════════════════════════════════════════
 // Download Report
@@ -1452,7 +1898,7 @@ Generated: ${now}
 Sport:     ${cfg.emoji} ${cfg.name}
 Player:    ${d.playerSummary || 'Unknown'}
 Position:  ${d.position || 'N/A'}
-Category:  ${d.ageCategory || 'N/A'}
+Model:     ${state.activeGeminiModel} (Dynamic Model Resolution)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1509,6 +1955,10 @@ Powered by ScoutAI · Using Google Gemini Vision AI
 // ═══════════════════════════════════════════════
 els.newAnalysisBtn.addEventListener('click', () => {
   state.videoFile = null;
+  state.uploadedFileUri = null;
+  state.cachedFrames = [];
+  state.detectedPlayers = [];
+  state.selectedPlayerIds.clear();
   els.videoInput.value = '';
   els.videoPreview.src = '';
   els.videoPreviewWrap.classList.add('hidden');
@@ -1522,6 +1972,7 @@ els.newAnalysisBtn.addEventListener('click', () => {
 // ═══════════════════════════════════════════════
 window.addEventListener('scroll', () => {
   const nav = $('navbar');
+  if (!nav) return;
   if (window.scrollY > 40) {
     nav.style.background = 'rgba(7,11,24,0.95)';
   } else {
@@ -1529,11 +1980,62 @@ window.addEventListener('scroll', () => {
   }
 });
 
-// ── Init ───────────────────────────────────────
+// ── Live Model Discovery ─────────────────────────
+async function fetchAvailableGeminiModels(apiKey = null) {
+  const key = apiKey || state.apiKey;
+  if (!key) return;
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!Array.isArray(data.models)) return;
+
+    // Filter models supporting generateContent and not deprecated
+    const available = data.models
+      .filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      .map(m => m.name.replace(/^models\//, ''))
+      .filter(name => !/gemini-2.5-pro$|gemini-1.0/i.test(name)); // filter out known deprecated
+
+    if (available.length > 0) {
+      available.sort((a, b) => {
+        const score = m => {
+          if (/2.5-flash$/i.test(m)) return 100;
+          if (/3.1-pro/i.test(m)) return 95;
+          if (/2.0-flash$/i.test(m)) return 90;
+          if (/1.5-flash$/i.test(m)) return 85;
+          if (/flash/i.test(m)) return 80;
+          if (/pro/i.test(m)) return 70;
+          return 50;
+        };
+        return score(b) - score(a);
+      });
+
+      console.info('[Dynamic Model Resolution] Live models available for this API key:', available);
+      STABLE_GEMINI_MODELS.splice(0, STABLE_GEMINI_MODELS.length, ...new Set([...available, ...STABLE_GEMINI_MODELS]));
+      updateModelBadges();
+    }
+  } catch (err) {
+    console.warn('[Dynamic Model Resolution] Model discovery network check skipped:', err);
+  }
+}
+
+// ── Auto-migrate deprecated models in state ─────
+if (state.primaryModel === 'gemini-2.5-pro') {
+  state.primaryModel = DEFAULT_PRIMARY_MODEL;
+  localStorage.setItem('scoutai_primary_model', state.primaryModel);
+}
+if (state.activeGeminiModel === 'gemini-2.5-pro') {
+  state.activeGeminiModel = DEFAULT_PRIMARY_MODEL;
+  localStorage.setItem('scoutai_active_model', state.activeGeminiModel);
+}
+
+// ── Initialization ──────────────────────────────
+updateModelBadges();
+
 if (state.apiKey) {
-  console.log('[ScoutAI] API key found in localStorage.');
+  fetchAvailableGeminiModels(state.apiKey);
+  console.log('[ScoutAI] API key loaded. Dynamic Model Resolution initialized. Primary:', state.primaryModel, 'Active:', state.activeGeminiModel);
 } else {
-  // Prompt after a small delay
   setTimeout(() => {
     showToast('Add your Gemini API key to start analyzing videos!', 'info');
   }, 1500);
