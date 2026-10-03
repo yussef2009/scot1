@@ -4,22 +4,6 @@
    With Dynamic Model Resolution & Resilient Fallbacks
    ═══════════════════════════════════════════════ */
 
-// ── Verified Priority List of Stable Gemini Models ──
-// If the primary/requested model is unavailable (404, deprecated, unsupported),
-// rate-limited (429), or overloaded (503), the engine automatically falls
-// back through this priority chain until a working model responds.
-const STABLE_GEMINI_MODELS = [
-  'gemini-2.5-flash',       // Fast, high-intelligence multimodal Flash
-  'gemini-2.0-flash',       // Standard multimodal workhorse
-  'gemini-1.5-flash',       // Universally supported reliable fallback with wide quota
-  'gemini-3.1-pro-preview', // Latest recommended preview model
-  'gemini-2.5-flash-lite',  // Lightweight high-throughput fallback
-  'gemini-2.0-flash-lite',  // Fast fallback
-  'gemini-1.5-pro',         // High-intelligence Pro fallback
-];
-
-const DEFAULT_PRIMARY_MODEL = 'gemini-2.5-flash';
-
 // ── State ──────────────────────────────────────
 const GEMINI_MODELS = [
   'gemini-2.5-flash',
@@ -40,6 +24,7 @@ const state = {
   cachedFrames: [],             // base64 keyframes cached from scan for fast analysis
   detectedPlayers: [],          // array of player objects from scan
   selectedPlayerIds: new Set(), // which player ids are ticked
+  activeGeminiModel: GEMINI_MODELS[0],
 };
 
 // ── Sport Config ────────────────────────────────
@@ -446,21 +431,355 @@ async function extractVideoFrames(videoEl, numFrames = 3) {
   });
 }
 
+// ═══════════════════════════════════════════════
+// Dynamic Model Resolution Engine
+// ═══════════════════════════════════════════════
+
+/**
+ * Builds the prioritized chain of models to try.
+ * 1. User preferred/primary model (e.g. gemini-2.5-flash or test model like gemini-3.8-flash)
+ * 2. Currently active known working model
+ * 3. Stable model priority list in order of performance and availability
+ */
+function getModelPriorityList(overridePrimary = null) {
+  const preferred = overridePrimary || state.primaryModel || DEFAULT_PRIMARY_MODEL;
+  const candidates = [
+    preferred,
+    state.activeGeminiModel,
+    ...STABLE_GEMINI_MODELS,
+  ].filter(Boolean);
+
+  // Return unique candidate models preserving priority order
+  return [...new Set(candidates)];
+}
+
+function geminiGenerateUrl(model) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${state.apiKey}`;
+}
+
+/**
+ * Detects whether an error indicates the model itself is not available,
+ * not supported for generateContent, deprecated, or restricted for new users.
+ */
+function isUnavailableModelError(status, message) {
+  const msg = (message || '').toLowerCase();
+  if (status === 404 || status === 410) return true;
+  if (/no longer available|not available|not found|not supported|unknown model|invalid model|unsupported|deprecated|retired|discontinued/i.test(msg)) {
+    return true;
+  }
+  if (status === 400 || status === 403) {
+    if (/model|version|generatecontent|interactions api|please update your code/i.test(msg)) {
+      return true;
+    }
+  }
+  return /is not found for api version|not supported for generatecontent|models\/.*not found/i.test(msg);
+}
+
+/**
+ * Detects whether an error is due to temporary capacity, rate limits, or server congestion.
+ */
+function isCapacityOrQuotaError(status, message) {
+  const msg = (message || '').toLowerCase();
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  return /resource has been exhausted|quota|rate limit|high demand|overloaded|temporarily unavailable|try again later/i.test(msg);
+}
+
+function notifyModelSwitch(failedModel, nextModel, reason) {
+  const reasonText = reason === 'overloaded' ? 'is overloaded/quota limited' : 'is unavailable';
+  const text = `Model "${failedModel}" ${reasonText}. Auto-switching to "${nextModel}"...`;
+  console.warn(`[Dynamic Model Resolution] ${text}`);
+
+  if (state.isScanning) {
+    updateScanModalSub(text);
+  } else if (els.loadingLabel) {
+    els.loadingLabel.textContent = text;
+  }
+}
+
+function updateModelBadges() {
+  const name = state.activeGeminiModel || DEFAULT_PRIMARY_MODEL;
+  if (els.navModelName) els.navModelName.textContent = name;
+  if (els.modalActiveModelBadge) els.modalActiveModelBadge.textContent = name;
+}
+
+function extractGeminiText(data) {
+  const block = data?.promptFeedback?.blockReason;
+  if (block) {
+    throw new Error(`Request blocked by safety filters (${block}). Try a different video clip.`);
+  }
+  const candidate = data?.candidates?.[0];
+  if (!candidate) throw new Error('Empty response from Gemini');
+  const parts = candidate.content?.parts || [];
+  const textParts = parts.map(p => p.text).filter(Boolean);
+  const jsonPart = [...textParts].reverse().find(t => /[\{\[]/.test(t));
+  const text = (jsonPart || textParts.join('\n')).trim();
+  if (!text) {
+    const finish = candidate.finishReason;
+    if (finish === 'SAFETY') {
+      throw new Error('The model declined this footage due to safety settings. Try another clip.');
+    }
+    throw new Error(finish ? `Empty Gemini response (${finish})` : 'Empty response from Gemini');
+  }
+  return text;
+}
+
+/**
+ * Core generation function with Dynamic Model Resolution:
+ * Tries the preferred model first; if unavailable or overloaded,
+ * automatically falls back through the priority list of stable models.
+ */
+async function geminiGenerate(body, options = {}) {
+  const modelsToTry = getModelPriorityList(options.preferredModel);
+  let lastError = null;
+  const attemptedModels = [];
+
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const model = modelsToTry[mIdx];
+    attemptedModels.push(model);
+
+    // Up to 2 attempts for transient capacity errors, 1 attempt for unavailable models
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const url = geminiGenerateUrl(model);
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (res.ok) {
+          // Success! Update active working model
+          const previousActive = state.activeGeminiModel;
+          state.activeGeminiModel = model;
+          localStorage.setItem('scoutai_active_model', model);
+          updateModelBadges();
+
+          // Log dynamic fallback if we switched away from the initially attempted model
+          if (attemptedModels.length > 1) {
+            const failedModel = attemptedModels[0];
+            const msg = `Dynamic Model Resolution: Switched from "${failedModel}" to working alternative "${model}"`;
+            console.info(`[Dynamic Model Resolution] ${msg}`);
+            state.resolutionLog.push({ from: failedModel, to: model, timestamp: Date.now() });
+            showToast(`Auto-switched to working model: ${model}`, 'info');
+          }
+
+          return extractGeminiText(data);
+        }
+
+        const message = data?.error?.message || `Gemini API error (${res.status})`;
+        lastError = new Error(message);
+
+        // Case 1: Model is unavailable, deprecated, or unsupported
+        if (isUnavailableModelError(res.status, message)) {
+          // If Google suggested a replacement model in the error message, add it dynamically!
+          const suggestionMatch = message.match(/use\s+models\/([a-zA-Z0-9.\-_]+)/i);
+          if (suggestionMatch && suggestionMatch[1]) {
+            const suggestedModel = suggestionMatch[1];
+            if (!modelsToTry.includes(suggestedModel)) {
+              console.info(`[Dynamic Model Resolution] API recommended alternative: "${suggestedModel}". Enqueuing in priority list.`);
+              modelsToTry.splice(mIdx + 1, 0, suggestedModel);
+            }
+          }
+
+          const nextModel = modelsToTry[mIdx + 1];
+          if (nextModel) {
+            notifyModelSwitch(model, nextModel, 'unavailable');
+          }
+          // Break inner loop immediately to try the next model in the priority list
+          break;
+        }
+
+        // Case 2: Quota or capacity exhausted (429, 503)
+        if (isCapacityOrQuotaError(res.status, message)) {
+          const nextModel = modelsToTry[mIdx + 1];
+          if (nextModel && attempt >= 1) {
+            notifyModelSwitch(model, nextModel, 'overloaded');
+            break;
+          }
+          await delay(1200);
+          continue;
+        }
+
+        // Case 3: Bad API key (401 or 400 invalid key) -> Do not cycle models
+        if (res.status === 401 || (res.status === 400 && /api key|key not valid/i.test(message))) {
+          throw lastError;
+        }
+
+        // Other unexpected error: switch to next candidate in priority list
+        const nextCandidate = modelsToTry[mIdx + 1];
+        if (nextCandidate) {
+          console.warn(`[Dynamic Model Resolution] Model "${model}" error (${res.status}: ${message}). Switching to "${nextCandidate}"...`);
+          notifyModelSwitch(model, nextCandidate, 'unavailable');
+        }
+        break;
+
+      } catch (err) {
+        lastError = err;
+        if (err.message && /api key|key not valid/i.test(err.message)) {
+          throw err;
+        }
+        if (mIdx < modelsToTry.length - 1) {
+          console.warn(`[Dynamic Model Resolution] Request for "${model}" failed (${err.message}). Trying next candidate...`);
+          break;
+        }
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error(`Dynamic Model Resolution failed across models: ${attemptedModels.join(', ')}`);
+}
+
+// ═══════════════════════════════════════════════
+// Resilient JSON Parsing & Schemas
+// ═══════════════════════════════════════════════
+
 // Robust JSON extraction from AI response
 function cleanAndParseJSON(text) {
   if (!text) throw new Error('Empty response received from AI server.');
-  let cleaned = text.replace(/```json|```/g, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch (e) {
-    const jsonMatch = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-    if (jsonMatch) {
-      try {
-        return JSON.parse(jsonMatch[0]);
-      } catch (e2) { }
-    }
-    throw new Error('AI returned an invalid JSON format. Please try again.');
+  const cleaned = stripCodeFences(text);
+  const attempts = [
+    cleaned,
+    sliceBalancedJson(cleaned),
+    closeTruncatedJson(sliceBalancedJson(cleaned) || cleaned),
+    (sliceBalancedJson(cleaned) || cleaned).replace(/,\s*([}\]])/g, '$1'),
+    closeTruncatedJson((sliceBalancedJson(cleaned) || cleaned).replace(/,\s*([}\]])/g, '$1')),
+  ];
+
+  for (const candidate of attempts) {
+    const parsed = tryParseJson(candidate);
+    if (parsed) return parsed;
   }
+
+  console.warn('ScoutAI JSON parse failed. Raw preview:', cleaned.slice(0, 400));
+  throw new Error('AI returned an invalid JSON format. Please try again.');
+}
+
+function normalizeDetectedPlayers(parsed) {
+  let list = [];
+  if (Array.isArray(parsed)) list = parsed;
+  else if (Array.isArray(parsed?.players)) list = parsed.players;
+  else if (Array.isArray(parsed?.data?.players)) list = parsed.data.players;
+
+  return list
+    .filter(p => p && (p.label || p.id || p.name))
+    .map((p, i) => ({
+      id: String(p.id || `P${i + 1}`),
+      label: String(p.label || p.name || `Player ${i + 1}`),
+      team: p.team || '',
+      teamColor: p.teamColor || '#6366f1',
+      position: p.position || '',
+      description: p.description || '',
+      standoutTrait: p.standoutTrait || '',
+      emoji: p.emoji || '👤',
+    }));
+}
+
+async function requestPlayerScan(body) {
+  const configs = [scanGenerationConfig(true), scanGenerationConfig(false)];
+  let lastErr;
+  for (let i = 0; i < configs.length; i++) {
+    try {
+      const text = await geminiGenerate({ ...body, generationConfig: configs[i] });
+      return normalizeDetectedPlayers(cleanAndParseJSON(text));
+    } catch (err) {
+      lastErr = err;
+      if (state.isScanning) updateScanModalSub('Retrying player detection...');
+    }
+  }
+  throw lastErr || new Error('Player detection failed.');
+}
+
+function sanitizeGeminiModel(model) {
+  if (!model || /exp/i.test(model) || model === 'gemini-flash-latest' || model === 'gemini-2.0-flash') {
+    return GEMINI_MODELS[0];
+  }
+  return model;
+}
+
+function geminiGenerateUrl(model) {
+  const safeModel = sanitizeGeminiModel(model);
+  return `https://generativelanguage.googleapis.com/v1beta/models/${safeModel}:generateContent?key=${state.apiKey}`;
+}
+
+function isRetryableGeminiError(status, message) {
+  const msg = (message || '').toLowerCase();
+  if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true;
+  return /high demand|overloaded|unavailable|try again later|resource has been exhausted|temporarily/.test(msg);
+}
+
+function isUnavailableModelError(status, message) {
+  const msg = (message || '').toLowerCase();
+  return status === 404 || /not found|not supported for generatecontent/.test(msg);
+}
+
+function notifyGeminiRetry(model, waitMs, attempt) {
+  const seconds = Math.max(1, Math.round(waitMs / 1000));
+  const text = `${model} is busy (attempt ${attempt}). Retrying in ${seconds}s...`;
+  if (state.isScanning) updateScanModalSub(text);
+  else if (els.loadingLabel) els.loadingLabel.textContent = text;
+}
+
+function extractGeminiText(data) {
+  const block = data?.promptFeedback?.blockReason;
+  if (block) {
+    throw new Error(`Request blocked by the model (${block}). Try a different clip.`);
+  }
+  const candidate = data?.candidates?.[0];
+  if (!candidate) throw new Error('Empty response from Gemini');
+  const parts = candidate.content?.parts || [];
+  const textParts = parts.map(p => p.text).filter(Boolean);
+  const jsonPart = [...textParts].reverse().find(t => /[\{\[]/.test(t));
+  const text = (jsonPart || textParts.join('\n')).trim();
+  if (!text) {
+    const finish = candidate.finishReason;
+    if (finish === 'SAFETY') {
+      throw new Error('The model declined this footage. Try another clip.');
+    }
+    throw new Error(finish ? `Empty Gemini response (${finish})` : 'Empty response from Gemini');
+  }
+  return text;
+}
+
+async function geminiGenerate(body) {
+  const models = [...new Set(
+    [sanitizeGeminiModel(state.activeGeminiModel), ...GEMINI_MODELS].filter(Boolean)
+  )];
+  let lastError = null;
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await fetch(geminiGenerateUrl(model), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        state.activeGeminiModel = model;
+        return extractGeminiText(data);
+      }
+
+      const message = data?.error?.message || `Gemini API error (${res.status})`;
+      lastError = new Error(message);
+
+      if (isUnavailableModelError(res.status, message)) break;
+
+      if (!isRetryableGeminiError(res.status, message)) throw lastError;
+
+      const retryAfter = Number(res.headers.get('Retry-After'));
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : Math.min(10000, 1500 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 500);
+
+      notifyGeminiRetry(model, waitMs, attempt);
+      await delay(waitMs);
+    }
+  }
+
+  throw lastError || new Error('Gemini API error');
 }
 
 // ── Player detection via Frame Images ──────────
@@ -1086,7 +1405,7 @@ function fillReportDOM(d, cfg) {
   if (dlBtn) dlBtn.addEventListener('click', downloadReport);
   const naBtn = g('newAnalysisBtn');
   if (naBtn) naBtn.addEventListener('click', () => {
-    state.videoFile = null; state.uploadedFileUri = null;
+    state.videoFile = null; state.uploadedFileUri = null; state.cachedFrames = [];
     state.detectedPlayers = []; state.selectedPlayerIds.clear();
     els.videoInput.value = ''; els.videoPreview.src = '';
     els.videoPreviewWrap.classList.add('hidden');
